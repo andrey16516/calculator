@@ -1,3 +1,9 @@
-aiogram<3
-flask
-gunicorn
+pip>=25.0
+setuptools>=70.0
+wheel>=0.43.0
+
+aiogram==2.25.2
+aiohttp==3.8.6
+Babel==2.9.1
+Flask==3.0.2
+gunicorn==21.2.0
