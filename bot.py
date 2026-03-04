@@ -1,37 +1,12 @@
 import os
 import math
-import logging
 from dataclasses import dataclass
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InputFile
-from aiogram.utils import executor
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
-
-logging.basicConfig(level=logging.INFO)
-
-# -------------------- TOKEN --------------------
-
-def load_token() -> str:
-    t = os.getenv("BOT_TOKEN")
-    if t and t.strip():
-        return t.strip()
-
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(base_dir, "token.txt")
-    if not os.path.exists(path):
-        raise RuntimeError("Не найден токен. Создайте token.txt рядом с bot.py и вставьте токен одной строкой.")
-    with open(path, "r", encoding="utf-8") as f:
-        token = f.read().strip()
-    if not token:
-        raise RuntimeError("Файл token.txt пустой.")
-    return token
-
-
-bot = Bot(token=load_token())
-dp = Dispatcher(bot, storage=MemoryStorage())
+from aiogram import Dispatcher, Router, F
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InputFile
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
 
 
 # -------------------- METALS / ASSAYS --------------------
@@ -91,7 +66,7 @@ class WeaveCfg:
     w_round_step: float | None
 
 
-WEAVES = {
+WEAVES: dict[str, WeaveCfg] = {
     "Бисмарк": WeaveCfg("Бисмарк", "emp_k", k_ref=2.4, c_ref=None, rigel_factor=2.7,
                         d_round_mode="round", d_round_step=0.01, D_round_mode="round", D_round_step=0.1,
                         w_before_factor=None, w_after_factor=None, w_round_step=None),
@@ -141,17 +116,33 @@ PHOTO_FILES = {
     "Шопард": "chopard.jpg",
 }
 
-# -------------------- SOLDER CONFIG (GOLD ONLY) --------------------
+
+# -------------------- SOLDER --------------------
 
 CLASSIC_850_PER_1G = {"Ag": 0.13, "Cu": 0.13, "Zn": 0.06, "Cd": 0.10}
 REFRACTORY_850_PER_1G = {"Ag": 0.10, "Cu": 0.22, "Zn": 0.02}
 
-# -------------------- RINGS CONFIG --------------------
 
-RING_SEMIROUND_K = 0.766  # fitted to your data
+# -------------------- RINGS --------------------
+
+RING_SEMIROUND_K = 0.766
+
+
+# -------------------- TUBE --------------------
+
+def tube_blank_width(mode: str, thickness: float, diameter: float) -> float:
+    if mode == "inner":
+        return math.pi * (diameter + thickness)
+    if mode == "outer":
+        return math.pi * (diameter - thickness)
+    return math.pi * diameter
 
 
 # -------------------- UTIL --------------------
+
+def file_near_script(filename: str) -> str:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, filename)
 
 def parse_float(text: str) -> float:
     return float(text.replace(",", ".").strip())
@@ -163,9 +154,7 @@ def round_to_step(x: float, step: float) -> float:
     return round(x / step) * step
 
 def apply_round(x: float, mode: str, step: float) -> float:
-    if mode == "floor":
-        return floor_to_step(x, step)
-    return round_to_step(x, step)
+    return floor_to_step(x, step) if mode == "floor" else round_to_step(x, step)
 
 def round2(x: float) -> float:
     return round(x + 1e-12, 2)
@@ -173,20 +162,8 @@ def round2(x: float) -> float:
 def fmt_g(x: float) -> str:
     return f"{round2(x):.2f}"
 
-def file_near_script(filename: str) -> str:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_dir, filename)
 
-async def send_weave_photo_if_exists(message: types.Message, weave_key: str):
-    fname = PHOTO_FILES.get(weave_key)
-    if not fname:
-        return
-    path = file_near_script(fname)
-    if os.path.exists(path):
-        await message.answer_photo(InputFile(path), caption=f"Плетение: {WEAVES[weave_key].ui_name}")
-
-
-# -------------------- MATH (CHAINS) --------------------
+# -------------------- CALC --------------------
 
 def d_emp_k(M: float, L: float, k: float) -> float:
     return math.sqrt((3.0 * M) / (k * L))
@@ -195,9 +172,6 @@ def d_emp_c(M: float, L: float, c: float) -> float:
     return math.sqrt(c * (M / L))
 
 def calc_chain(rho: float, weave_key: str, L: float, M: float) -> dict:
-    if M <= 0 or L <= 0:
-        raise ValueError
-
     w = WEAVES[weave_key]
 
     if w.model == "emp_k":
@@ -220,14 +194,8 @@ def calc_chain(rho: float, weave_key: str, L: float, M: float) -> dict:
 
     return out
 
-
-# -------------------- MATH (SOLDER) --------------------
-
 def scale_recipe(recipe: dict, grams: float) -> dict:
     return {k: recipe[k] * grams for k in recipe}
-
-
-# -------------------- MATH (RINGS) --------------------
 
 def ring_shank_length_mm(d_in_mm: float, t_mm: float) -> float:
     return math.pi * (d_in_mm + t_mm)
@@ -239,127 +207,152 @@ def ring_weight_semiround_g(rho: float, L_mm: float, w_mm: float, t_mm: float) -
     return rho * ((RING_SEMIROUND_K * w_mm * t_mm * L_mm) / 1000.0)
 
 
-# -------------------- MATH (TUBE) --------------------
-
-def tube_blank_width(mode: str, thickness: float, diameter: float) -> float:
-    if mode == "inner":
-        return math.pi * (diameter + thickness)
-    if mode == "outer":
-        return math.pi * (diameter - thickness)
-    return math.pi * diameter
-
-
 # -------------------- KEYBOARDS --------------------
 
 def kb_main():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("🧮 Расчет цепи"))
-    kb.add(KeyboardButton("🧪 Припой"))
-    kb.add(KeyboardButton("💍 Расчет обручальных колец"))
-    kb.add(KeyboardButton("Расчет трубки"))
-    kb.add(KeyboardButton("❌ Отмена"))
-    return kb
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🧮 Расчет цепи")],
+            [KeyboardButton(text="🧪 Припой")],
+            [KeyboardButton(text="💍 Расчет обручальных колец")],
+            [KeyboardButton(text="Расчет трубки")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True
+    )
 
 def kb_chain_metals():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton("Золото 585"), KeyboardButton("Серебро 925"))
-    kb.row(KeyboardButton("Золото другая проба"), KeyboardButton("Серебро другая проба"))
-    kb.add(KeyboardButton("❌ Отмена"))
-    return kb
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Золото 585"), KeyboardButton(text="Серебро 925")],
+            [KeyboardButton(text="Золото другая проба"), KeyboardButton(text="Серебро другая проба")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True
+    )
 
 def kb_gold_assays():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    rows = []
     assays = list(GOLD_ASSAYS.keys())
     for i in range(0, len(assays), 2):
-        kb.row(*[KeyboardButton(a) for a in assays[i:i+2]])
-    kb.add(KeyboardButton("❌ Отмена"))
-    return kb
+        rows.append([KeyboardButton(text=a) for a in assays[i:i+2]])
+    rows.append([KeyboardButton(text="❌ Отмена")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 def kb_silver_assays():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    rows = []
     assays = list(SILVER_ASSAYS.keys())
     for i in range(0, len(assays), 2):
-        kb.row(*[KeyboardButton(a) for a in assays[i:i+2]])
-    kb.add(KeyboardButton("❌ Отмена"))
-    return kb
+        rows.append([KeyboardButton(text=a) for a in assays[i:i+2]])
+    rows.append([KeyboardButton(text="❌ Отмена")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 def kb_weaves():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton("Бисмарк"), KeyboardButton("Московский бисмарк"))
-    kb.row(KeyboardButton("Московский бит"), KeyboardButton("Рамзес"))
-    kb.row(KeyboardButton("Американка"), KeyboardButton("Лисий хвост (византия)"))
-    kb.row(KeyboardButton("Якорное"), KeyboardButton("Панцирное"))
-    kb.row(KeyboardButton("Шопард"))
-    kb.add(KeyboardButton("❌ Отмена"))
-    return kb
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Бисмарк"), KeyboardButton(text="Московский бисмарк")],
+            [KeyboardButton(text="Московский бит"), KeyboardButton(text="Рамзес")],
+            [KeyboardButton(text="Американка"), KeyboardButton(text="Лисий хвост (византия)")],
+            [KeyboardButton(text="Якорное"), KeyboardButton(text="Панцирное")],
+            [KeyboardButton(text="Шопард")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True
+    )
 
 def kb_after_chain():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("🔁 Повторить такую же цепь"))
-    kb.add(KeyboardButton("🧮 Новый расчет"))
-    kb.add(KeyboardButton("🏠 В меню"))
-    kb.add(KeyboardButton("❌ Отмена"))
-    return kb
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔁 Повторить такую же цепь")],
+            [KeyboardButton(text="🧮 Новый расчет")],
+            [KeyboardButton(text="🏠 В меню")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True
+    )
 
 def kb_solder_gold_types():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("Классический"))
-    kb.add(KeyboardButton("Тугоплавкий"))
-    kb.add(KeyboardButton("🏠 В меню"))
-    kb.add(KeyboardButton("❌ Отмена"))
-    return kb
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Классический"), KeyboardButton(text="Тугоплавкий")],
+            [KeyboardButton(text="🏠 В меню")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True
+    )
 
 def kb_solder_assay_850():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("850 проба"))
-    kb.add(KeyboardButton("🏠 В меню"))
-    kb.add(KeyboardButton("❌ Отмена"))
-    return kb
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="850 проба")],
+            [KeyboardButton(text="🏠 В меню")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True
+    )
 
 def kb_after_solder():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("🧪 Еще раз припой"))
-    kb.add(KeyboardButton("🏠 В меню"))
-    kb.add(KeyboardButton("❌ Отмена"))
-    return kb
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🧪 Еще раз припой")],
+            [KeyboardButton(text="🏠 В меню")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True
+    )
 
 def kb_ring_metals():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton("Золото 585"), KeyboardButton("Серебро 925"))
-    kb.row(KeyboardButton("Золото другая проба"), KeyboardButton("Серебро другая проба"))
-    kb.add(KeyboardButton("❌ Отмена"))
-    return kb
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Золото 585"), KeyboardButton(text="Серебро 925")],
+            [KeyboardButton(text="Золото другая проба"), KeyboardButton(text="Серебро другая проба")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True
+    )
 
 def kb_ring_sections():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton("Полукруглое"), KeyboardButton("Прямоугольное"))
-    kb.add(KeyboardButton("🏠 В меню"))
-    kb.add(KeyboardButton("❌ Отмена"))
-    return kb
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Полукруглое"), KeyboardButton(text="Прямоугольное")],
+            [KeyboardButton(text="🏠 В меню")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True
+    )
 
 def kb_after_ring():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("💍 Еще одно кольцо"))
-    kb.add(KeyboardButton("🏠 В меню"))
-    kb.add(KeyboardButton("❌ Отмена"))
-    return kb
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="💍 Еще одно кольцо")],
+            [KeyboardButton(text="🏠 В меню")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True
+    )
 
 def kb_tube_modes():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton("Внешний диаметр"), KeyboardButton("Средний диаметр"), KeyboardButton("Внутренний диаметр"))
-    kb.add(KeyboardButton("🏠 В меню"))
-    kb.add(KeyboardButton("❌ Отмена"))
-    return kb
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Внешний диаметр"), KeyboardButton(text="Средний диаметр"), KeyboardButton(text="Внутренний диаметр")],
+            [KeyboardButton(text="🏠 В меню")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True
+    )
 
 def kb_after_tube():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("Еще расчет трубки"))
-    kb.add(KeyboardButton("🏠 В меню"))
-    kb.add(KeyboardButton("❌ Отмена"))
-    return kb
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Еще расчет трубки")],
+            [KeyboardButton(text="🏠 В меню")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True
+    )
 
 
-# -------------------- STATES --------------------
+# -------------------- FSM STATES --------------------
 
 class ChainStates(StatesGroup):
     choosing_metal = State()
@@ -394,120 +387,134 @@ class TubeStates(StatesGroup):
     thickness = State()
 
 
-# -------------------- COMMON --------------------
+# -------------------- ROUTER / DISPATCHER --------------------
 
-@dp.message_handler(commands=["start"])
-async def start(message: types.Message):
+router = Router()
+dp = Dispatcher(storage=MemoryStorage())
+dp.include_router(router)
+
+
+# -------------------- HANDLERS COMMON --------------------
+
+@router.message(F.text == "/start")
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer("Ювелирный калькулятор", reply_markup=kb_main())
 
-@dp.message_handler(lambda m: m.text == "❌ Отмена", state="*")
-async def cancel(message: types.Message, state: FSMContext):
-    await state.finish()
+@router.message(F.text == "❌ Отмена")
+async def cancel_any(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer("Отменено.", reply_markup=kb_main())
 
-@dp.message_handler(lambda m: m.text == "🏠 В меню", state="*")
-async def to_menu(message: types.Message, state: FSMContext):
-    await state.finish()
+@router.message(F.text == "🏠 В меню")
+async def to_menu(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer("Меню:", reply_markup=kb_main())
 
 
-# -------------------- CHAINS FLOW --------------------
+# -------------------- CHAINS --------------------
 
-@dp.message_handler(lambda m: m.text == "🧮 Расчет цепи")
-async def chains_entry(message: types.Message, state: FSMContext):
-    await state.finish()
+@router.message(F.text == "🧮 Расчет цепи")
+async def chains_entry(message: Message, state: FSMContext):
+    await state.clear()
     await state.update_data(chain_group=DEFAULT_CHAIN_METAL[0], chain_assay=DEFAULT_CHAIN_METAL[1])
     await message.answer("Выберите металл/пробу:", reply_markup=kb_chain_metals())
-    await ChainStates.choosing_metal.set()
+    await state.set_state(ChainStates.choosing_metal)
 
-@dp.message_handler(lambda m: m.text == "Золото 585", state=ChainStates.choosing_metal)
-async def chains_gold_585(message: types.Message, state: FSMContext):
+@router.message(ChainStates.choosing_metal, F.text == "Золото 585")
+async def chains_gold_585(message: Message, state: FSMContext):
     await state.update_data(chain_group="gold", chain_assay="585")
     await message.answer("Выберите плетение:", reply_markup=kb_weaves())
-    await ChainStates.weave.set()
+    await state.set_state(ChainStates.weave)
 
-@dp.message_handler(lambda m: m.text == "Серебро 925", state=ChainStates.choosing_metal)
-async def chains_silver_925(message: types.Message, state: FSMContext):
+@router.message(ChainStates.choosing_metal, F.text == "Серебро 925")
+async def chains_silver_925(message: Message, state: FSMContext):
     await state.update_data(chain_group="silver", chain_assay="925")
     await message.answer("Выберите плетение:", reply_markup=kb_weaves())
-    await ChainStates.weave.set()
+    await state.set_state(ChainStates.weave)
 
-@dp.message_handler(lambda m: m.text == "Золото другая проба", state=ChainStates.choosing_metal)
-async def chains_gold_other(message: types.Message, state: FSMContext):
+@router.message(ChainStates.choosing_metal, F.text == "Золото другая проба")
+async def chains_gold_other(message: Message, state: FSMContext):
     await message.answer("Выберите пробу золота:", reply_markup=kb_gold_assays())
-    await ChainStates.choosing_gold_assay.set()
+    await state.set_state(ChainStates.choosing_gold_assay)
 
-@dp.message_handler(lambda m: m.text in GOLD_ASSAYS.keys(), state=ChainStates.choosing_gold_assay)
-async def chains_gold_assay_selected(message: types.Message, state: FSMContext):
+@router.message(ChainStates.choosing_gold_assay, F.text.in_(list(GOLD_ASSAYS.keys())))
+async def chains_gold_assay_selected(message: Message, state: FSMContext):
     await state.update_data(chain_group="gold", chain_assay=message.text)
     await message.answer("Выберите плетение:", reply_markup=kb_weaves())
-    await ChainStates.weave.set()
+    await state.set_state(ChainStates.weave)
 
-@dp.message_handler(lambda m: m.text == "Серебро другая проба", state=ChainStates.choosing_metal)
-async def chains_silver_other(message: types.Message, state: FSMContext):
+@router.message(ChainStates.choosing_metal, F.text == "Серебро другая проба")
+async def chains_silver_other(message: Message, state: FSMContext):
     await message.answer("Выберите пробу серебра:", reply_markup=kb_silver_assays())
-    await ChainStates.choosing_silver_assay.set()
+    await state.set_state(ChainStates.choosing_silver_assay)
 
-@dp.message_handler(lambda m: m.text in SILVER_ASSAYS.keys(), state=ChainStates.choosing_silver_assay)
-async def chains_silver_assay_selected(message: types.Message, state: FSMContext):
+@router.message(ChainStates.choosing_silver_assay, F.text.in_(list(SILVER_ASSAYS.keys())))
+async def chains_silver_assay_selected(message: Message, state: FSMContext):
     await state.update_data(chain_group="silver", chain_assay=message.text)
     await message.answer("Выберите плетение:", reply_markup=kb_weaves())
-    await ChainStates.weave.set()
+    await state.set_state(ChainStates.weave)
 
-@dp.message_handler(lambda m: m.text in WEAVES.keys(), state=ChainStates.weave)
-async def chains_choose_weave(message: types.Message, state: FSMContext):
+@router.message(ChainStates.weave, F.text.in_(list(WEAVES.keys())))
+async def chains_choose_weave(message: Message, state: FSMContext):
     weave_key = message.text
     await state.update_data(weave=weave_key)
-    await send_weave_photo_if_exists(message, weave_key)
-    await message.answer("Введите длину изделия (см):")
-    await ChainStates.length.set()
 
-@dp.message_handler(lambda m: m.text == "🧮 Новый расчет", state="*")
-async def chains_new_calc(message: types.Message, state: FSMContext):
+    # show photo once on selection
+    fname = PHOTO_FILES.get(weave_key)
+    if fname:
+        path = file_near_script(fname)
+        if os.path.exists(path):
+            await message.answer_photo(InputFile(path), caption=f"Плетение: {WEAVES[weave_key].ui_name}")
+
+    await message.answer("Введите длину изделия (см):")
+    await state.set_state(ChainStates.length)
+
+@router.message(F.text == "🧮 Новый расчет")
+async def chains_new_calc(message: Message, state: FSMContext):
     await chains_entry(message, state)
 
-@dp.message_handler(lambda m: m.text == "🔁 Повторить такую же цепь", state=ChainStates.after)
-async def chains_repeat(message: types.Message, state: FSMContext):
+@router.message(ChainStates.after, F.text == "🔁 Повторить такую же цепь")
+async def chains_repeat(message: Message, state: FSMContext):
     data = await state.get_data()
     weave_key = data.get("weave")
-    if not weave_key:
-        await state.finish()
-        return await message.answer("Сначала сделайте расчет.", reply_markup=kb_main())
     await message.answer(f"Повтор: {WEAVES[weave_key].ui_name}\nВведите длину изделия (см):")
-    await ChainStates.length.set()
+    await state.set_state(ChainStates.length)
 
-@dp.message_handler(state=ChainStates.length)
-async def chains_length(message: types.Message, state: FSMContext):
+@router.message(ChainStates.length)
+async def chains_length(message: Message, state: FSMContext):
     try:
         L_total = parse_float(message.text)
         if L_total <= 0:
             raise ValueError
     except Exception:
-        return await message.reply("Длина должна быть числом > 0.")
+        return await message.answer("Введите корректную длину (например 55).")
+
     await state.update_data(L_total=L_total)
     await message.answer("Введите массу изделия (г):")
-    await ChainStates.mass.set()
+    await state.set_state(ChainStates.mass)
 
-@dp.message_handler(state=ChainStates.mass)
-async def chains_mass(message: types.Message, state: FSMContext):
+@router.message(ChainStates.mass)
+async def chains_mass(message: Message, state: FSMContext):
     try:
         M_total = parse_float(message.text)
         if M_total <= 0:
             raise ValueError
     except Exception:
-        return await message.reply("Масса должна быть числом > 0.")
+        return await message.answer("Введите корректную массу (например 20).")
+
     await state.update_data(M_total=M_total)
     await message.answer("Длина замка + концевиков (см). Если нет — 0:")
-    await ChainStates.lock_len.set()
+    await state.set_state(ChainStates.lock_len)
 
-@dp.message_handler(state=ChainStates.lock_len)
-async def chains_lock_len(message: types.Message, state: FSMContext):
+@router.message(ChainStates.lock_len)
+async def chains_lock_len(message: Message, state: FSMContext):
     try:
         L_lock = parse_float(message.text)
         if L_lock < 0:
             raise ValueError
     except Exception:
-        return await message.reply("Введите число >= 0.")
+        return await message.answer("Введите число >= 0.")
 
     await state.update_data(L_lock=L_lock)
 
@@ -516,20 +523,21 @@ async def chains_lock_len(message: types.Message, state: FSMContext):
         return await chains_finish_calc(message, state)
 
     await message.answer("Масса замка + концевиков (г):")
-    await ChainStates.lock_mass.set()
+    await state.set_state(ChainStates.lock_mass)
 
-@dp.message_handler(state=ChainStates.lock_mass)
-async def chains_lock_mass(message: types.Message, state: FSMContext):
+@router.message(ChainStates.lock_mass)
+async def chains_lock_mass(message: Message, state: FSMContext):
     try:
         M_lock = parse_float(message.text)
         if M_lock < 0:
             raise ValueError
     except Exception:
-        return await message.reply("Введите число >= 0.")
+        return await message.answer("Введите число >= 0.")
+
     await state.update_data(M_lock=M_lock)
     await chains_finish_calc(message, state)
 
-async def chains_finish_calc(message: types.Message, state: FSMContext):
+async def chains_finish_calc(message: Message, state: FSMContext):
     data = await state.get_data()
 
     group = data["chain_group"]
@@ -550,10 +558,10 @@ async def chains_finish_calc(message: types.Message, state: FSMContext):
         L_weave = L_total - L_lock
         M_weave = M_total - M_lock
         if L_weave <= 0:
-            await state.finish()
+            await state.clear()
             return await message.answer("Ошибка: длина замка больше/равна длине изделия.", reply_markup=kb_main())
         if M_weave <= 0:
-            await state.finish()
+            await state.clear()
             return await message.answer("Ошибка: масса замка больше/равна массе изделия.", reply_markup=kb_main())
 
     res = calc_chain(rho, weave_key, L_weave, M_weave)
@@ -593,33 +601,39 @@ async def chains_finish_calc(message: types.Message, state: FSMContext):
         )
 
     await message.answer(text, reply_markup=kb_after_chain())
-    await ChainStates.after.set()
+    await state.set_state(ChainStates.after)
 
 
-# -------------------- SOLDER FLOW --------------------
+# -------------------- SOLDER --------------------
 
-@dp.message_handler(lambda m: m.text == "🧪 Припой")
-async def solder_entry(message: types.Message, state: FSMContext):
-    await state.finish()
+@router.message(F.text == "🧪 Припой")
+async def solder_entry(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer("Припой (золото). Выберите тип:", reply_markup=kb_solder_gold_types())
-    await SolderStates.choosing_type.set()
+    await state.set_state(SolderStates.choosing_type)
 
-@dp.message_handler(lambda m: m.text in ["Классический", "Тугоплавкий"], state=SolderStates.choosing_type)
-async def solder_choose_type(message: types.Message, state: FSMContext):
+@router.message(SolderStates.choosing_type, F.text.in_(["Классический", "Тугоплавкий"]))
+async def solder_choose_type(message: Message, state: FSMContext):
     await state.update_data(solder_type=message.text)
     await message.answer("Выберите пробу исходного металла:", reply_markup=kb_solder_assay_850())
-    await SolderStates.choosing_assay.set()
+    await state.set_state(SolderStates.choosing_assay)
 
-@dp.message_handler(lambda m: m.text == "850 проба", state=SolderStates.choosing_assay)
-async def solder_choose_assay(message: types.Message, state: FSMContext):
-    await state.update_data(assay=850)
+@router.message(SolderStates.choosing_assay, F.text == "850 проба")
+async def solder_choose_assay(message: Message, state: FSMContext):
     await message.answer("Сколько грамм пересчитать? (например 1 или 0.5)")
-    await SolderStates.waiting_grams.set()
+    await state.set_state(SolderStates.waiting_grams)
 
-@dp.message_handler(state=SolderStates.waiting_grams)
-async def solder_grams(message: types.Message, state: FSMContext):
-    grams = parse_float(message.text)
-    stype = (await state.get_data()).get("solder_type")
+@router.message(SolderStates.waiting_grams)
+async def solder_grams(message: Message, state: FSMContext):
+    try:
+        grams = parse_float(message.text)
+        if grams <= 0:
+            raise ValueError
+    except Exception:
+        return await message.answer("Введите число > 0 (например 1 или 0.5).")
+
+    data = await state.get_data()
+    stype = data.get("solder_type")
     recipe_per_1g = REFRACTORY_850_PER_1G if stype == "Тугоплавкий" else CLASSIC_850_PER_1G
     recipe = scale_recipe(recipe_per_1g, grams)
 
@@ -635,85 +649,61 @@ async def solder_grams(message: types.Message, state: FSMContext):
     if "Cd" in recipe_per_1g:
         lines.append(f"Cd (кадмий): {fmt_g(recipe.get('Cd', 0.0))} г")
 
-    await state.finish()
-    await message.answer("\n".join(lines), reply_markup=kb_after_solder())
+    await state.clear()
+    await message.answer("\n".join(lines), reply_markup=kb_after_solder)
 
-@dp.message_handler(lambda m: m.text == "🧪 Еще раз припой", state="*")
-async def solder_again(message: types.Message, state: FSMContext):
-    await state.finish()
-    await message.answer("Припой (золото). Выберите тип:", reply_markup=kb_solder_gold_types())
-    await SolderStates.choosing_type.set()
+@router.message(F.text == "🧪 Еще раз припой")
+async def solder_again(message: Message, state: FSMContext):
+    await solder_entry(message, state)
 
 
-# -------------------- RINGS FLOW --------------------
+# -------------------- RINGS --------------------
 
-@dp.message_handler(lambda m: m.text == "💍 Расчет обручальных колец")
-async def ring_entry(message: types.Message, state: FSMContext):
-    await state.finish()
+@router.message(F.text == "💍 Расчет обручальных колец")
+async def ring_entry(message: Message, state: FSMContext):
+    await state.clear()
     await state.update_data(ring_group=DEFAULT_RING_METAL[0], ring_assay=DEFAULT_RING_METAL[1])
-    await message.answer("Выберите металл/пробу:", reply_markup=kb_ring_metals())
-    await RingStates.choosing_metal.set()
+    await message.answer("Выберите металл/пробу:", reply_markup=kb_chain_metals())
+    await state.set_state(RingStates.choosing_metal)
 
-@dp.message_handler(lambda m: m.text == "Золото 585", state=RingStates.choosing_metal)
-async def ring_gold_585(message: types.Message, state: FSMContext):
+@router.message(RingStates.choosing_metal, F.text == "Золото 585")
+async def ring_gold_585(message: Message, state: FSMContext):
     await state.update_data(ring_group="gold", ring_assay="585")
     await message.answer("Выберите сечение:", reply_markup=kb_ring_sections())
-    await RingStates.section.set()
+    await state.set_state(RingStates.section)
 
-@dp.message_handler(lambda m: m.text == "Серебро 925", state=RingStates.choosing_metal)
-async def ring_silver_925(message: types.Message, state: FSMContext):
+@router.message(RingStates.choosing_metal, F.text == "Серебро 925")
+async def ring_silver_925(message: Message, state: FSMContext):
     await state.update_data(ring_group="silver", ring_assay="925")
     await message.answer("Выберите сечение:", reply_markup=kb_ring_sections())
-    await RingStates.section.set()
+    await state.set_state(RingStates.section)
 
-@dp.message_handler(lambda m: m.text == "Золото другая проба", state=RingStates.choosing_metal)
-async def ring_gold_other(message: types.Message, state: FSMContext):
-    await message.answer("Выберите пробу золота:", reply_markup=kb_gold_assays())
-    await RingStates.choosing_gold_assay.set()
-
-@dp.message_handler(lambda m: m.text in GOLD_ASSAYS.keys(), state=RingStates.choosing_gold_assay)
-async def ring_gold_assay_selected(message: types.Message, state: FSMContext):
-    await state.update_data(ring_group="gold", ring_assay=message.text)
-    await message.answer("Выберите сечение:", reply_markup=kb_ring_sections())
-    await RingStates.section.set()
-
-@dp.message_handler(lambda m: m.text == "Серебро другая проба", state=RingStates.choosing_metal)
-async def ring_silver_other(message: types.Message, state: FSMContext):
-    await message.answer("Выберите пробу серебра:", reply_markup=kb_silver_assays())
-    await RingStates.choosing_silver_assay.set()
-
-@dp.message_handler(lambda m: m.text in SILVER_ASSAYS.keys(), state=RingStates.choosing_silver_assay)
-async def ring_silver_assay_selected(message: types.Message, state: FSMContext):
-    await state.update_data(ring_group="silver", ring_assay=message.text)
-    await message.answer("Выберите сечение:", reply_markup=kb_ring_sections())
-    await RingStates.section.set()
-
-@dp.message_handler(lambda m: m.text in ["Полукруглое", "Прямоугольное"], state=RingStates.section)
-async def ring_section(message: types.Message, state: FSMContext):
+@router.message(RingStates.section, F.text.in_(["Полукруглое", "Прямоугольное"]))
+async def ring_section(message: Message, state: FSMContext):
     await state.update_data(section=message.text)
     await message.answer("Внутренний диаметр (мм):")
-    await RingStates.d_in.set()
+    await state.set_state(RingStates.d_in)
 
-@dp.message_handler(state=RingStates.d_in)
-async def ring_d_in(message: types.Message, state: FSMContext):
+@router.message(RingStates.d_in)
+async def ring_d_in(message: Message, state: FSMContext):
     await state.update_data(d_in=parse_float(message.text))
     await message.answer("Ширина (мм):")
-    await RingStates.width.set()
+    await state.set_state(RingStates.width)
 
-@dp.message_handler(state=RingStates.width)
-async def ring_width(message: types.Message, state: FSMContext):
+@router.message(RingStates.width)
+async def ring_width(message: Message, state: FSMContext):
     await state.update_data(w=parse_float(message.text))
     await message.answer("Толщина (мм):")
-    await RingStates.thickness.set()
+    await state.set_state(RingStates.thickness)
 
-@dp.message_handler(state=RingStates.thickness)
-async def ring_thickness(message: types.Message, state: FSMContext):
+@router.message(RingStates.thickness)
+async def ring_thickness(message: Message, state: FSMContext):
     await state.update_data(t=parse_float(message.text))
     await message.answer("Цена за 1 г (руб). Если не надо — 0:")
-    await RingStates.price.set()
+    await state.set_state(RingStates.price)
 
-@dp.message_handler(state=RingStates.price)
-async def ring_price(message: types.Message, state: FSMContext):
+@router.message(RingStates.price)
+async def ring_price(message: Message, state: FSMContext):
     price = parse_float(message.text)
     data = await state.get_data()
 
@@ -739,50 +729,52 @@ async def ring_price(message: types.Message, state: FSMContext):
         f"Стоимость металла: {cost:.2f} руб.\n"
     )
 
-    await state.finish()
+    await state.clear()
     await message.answer(text, reply_markup=kb_after_ring())
 
-@dp.message_handler(lambda m: m.text == "💍 Еще одно кольцо", state="*")
-async def ring_again(message: types.Message, state: FSMContext):
-    await ring_entry(message, state)
 
+# -------------------- TUBE --------------------
 
-# -------------------- TUBE FLOW --------------------
-
-@dp.message_handler(lambda m: m.text == "Расчет трубки")
-async def tube_entry(message: types.Message, state: FSMContext):
-    await state.finish()
+@router.message(F.text == "Расчет трубки")
+async def tube_entry(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer("Выберите режим диаметра:", reply_markup=kb_tube_modes())
-    await TubeStates.mode.set()
+    await state.set_state(TubeStates.mode)
 
-@dp.message_handler(lambda m: m.text in ["Внешний диаметр", "Средний диаметр", "Внутренний диаметр"], state=TubeStates.mode)
-async def tube_mode(message: types.Message, state: FSMContext):
+@router.message(TubeStates.mode, F.text.in_(["Внешний диаметр", "Средний диаметр", "Внутренний диаметр"]))
+async def tube_mode(message: Message, state: FSMContext):
     mode_map = {"Внешний диаметр": "outer", "Средний диаметр": "mid", "Внутренний диаметр": "inner"}
     await state.update_data(mode=mode_map[message.text])
     await message.answer("Диаметр трубки (мм):")
-    await TubeStates.diameter.set()
+    await state.set_state(TubeStates.diameter)
 
-@dp.message_handler(state=TubeStates.diameter)
-async def tube_diameter(message: types.Message, state: FSMContext):
-    diameter = parse_float(message.text)
-    if diameter <= 0:
-        return await message.reply("Введите число > 0.")
+@router.message(TubeStates.diameter)
+async def tube_diameter(message: Message, state: FSMContext):
+    try:
+        diameter = parse_float(message.text)
+        if diameter <= 0:
+            raise ValueError
+    except Exception:
+        return await message.answer("Введите число > 0.")
     await state.update_data(diameter=diameter)
     await message.answer("Толщина заготовки (мм):")
-    await TubeStates.thickness.set()
+    await state.set_state(TubeStates.thickness)
 
-@dp.message_handler(state=TubeStates.thickness)
-async def tube_thickness(message: types.Message, state: FSMContext):
-    thickness = parse_float(message.text)
-    if thickness <= 0:
-        return await message.reply("Введите число > 0.")
+@router.message(TubeStates.thickness)
+async def tube_thickness(message: Message, state: FSMContext):
+    try:
+        thickness = parse_float(message.text)
+        if thickness <= 0:
+            raise ValueError
+    except Exception:
+        return await message.answer("Введите число > 0.")
 
     data = await state.get_data()
     mode = data["mode"]
     diameter = float(data["diameter"])
 
     if mode == "outer" and diameter <= thickness:
-        await state.finish()
+        await state.clear()
         return await message.answer("Ошибка: для внешнего диаметра диаметр должен быть больше толщины.", reply_markup=kb_main())
 
     width = tube_blank_width(mode, thickness, diameter)
@@ -797,15 +789,9 @@ async def tube_thickness(message: types.Message, state: FSMContext):
         f"Ширина заготовки: {width_out:.2f} мм\n"
     )
 
-    await state.finish()
+    await state.clear()
     await message.answer(text, reply_markup=kb_after_tube())
 
-@dp.message_handler(lambda m: m.text == "Еще расчет трубки", state="*")
-async def tube_again(message: types.Message, state: FSMContext):
+@router.message(F.text == "Еще расчет трубки")
+async def tube_again(message: Message, state: FSMContext):
     await tube_entry(message, state)
-
-
-# -------------------- RUN --------------------
-
-if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)

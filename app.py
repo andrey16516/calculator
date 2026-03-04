@@ -1,41 +1,67 @@
 import os
+import asyncio
 import logging
-from flask import Flask, request
-from aiogram import types
-from aiogram.utils.executor import start_webhook
 
-from bot import dp, bot
+from aiohttp import web
+from aiogram import Bot, Dispatcher
+from aiogram.types import Update
+
+from bot import dp  # dp exported from bot.py
 
 logging.basicConfig(level=logging.INFO)
 
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN env var is not set")
+
+BOT_WEBHOOK_SECRET = os.getenv("BOT_WEBHOOK_SECRET", "secret").strip()
+WEBHOOK_PATH = f"/webhook/{BOT_WEBHOOK_SECRET}"
+
+# Render provides this
 WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-WEBHOOK_PATH = f"/webhook/{os.getenv('BOT_WEBHOOK_SECRET', 'secret')}"
+if not WEBHOOK_HOST:
+    logging.warning("RENDER_EXTERNAL_URL is not set yet (Render sets it at runtime).")
+
 WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 
-WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(os.getenv("PORT", "10000"))
+PORT = int(os.getenv("PORT", "10000"))
 
-app = Flask(__name__)
+# Create bot here and inject to dispatcher
+bot = Bot(token=BOT_TOKEN)
+dp["bot"] = bot  # store bot in dispatcher context
 
-@app.post(WEBHOOK_PATH)
-async def webhook():
-    update = types.Update(**request.json)
-    await dp.process_update(update)
-    return "ok"
 
-async def on_startup(_):
-    await bot.set_webhook(WEBHOOK_URL)
+async def handle_webhook(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        update = Update.model_validate(data)
+        await dp.feed_update(bot=bot, update=update)
+        return web.Response(text="ok")
+    except Exception:
+        logging.exception("Webhook handling error")
+        return web.Response(status=500, text="error")
 
-async def on_shutdown(_):
+
+async def on_startup(app: web.Application):
+    # Set webhook
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    logging.info("Webhook set to %s", WEBHOOK_URL)
+
+
+async def on_cleanup(app: web.Application):
     await bot.delete_webhook()
+    await bot.session.close()
+
+
+def main():
+    app = web.Application()
+    app.router.add_post(WEBHOOK_PATH, handle_webhook)
+
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+
+    web.run_app(app, host="0.0.0.0", port=PORT)
+
 
 if __name__ == "__main__":
-    start_webhook(
-        dispatcher=dp,
-        webhook_path=WEBHOOK_PATH,
-        on_startup=on_startup,
-        on_shutdown=on_shutdown,
-        skip_updates=True,
-        host=WEBAPP_HOST,
-        port=WEBAPP_PORT,
-    )
+    main()
