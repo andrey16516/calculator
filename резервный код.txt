@@ -1,0 +1,171 @@
+import logging
+import math
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils import executor
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+
+API_TOKEN = "8749483224:AAEl94YvsgXxmAP7UDWcMYvZc01wZK0lj4w"
+
+logging.basicConfig(level=logging.INFO)
+
+storage = MemoryStorage()
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot, storage=storage)
+
+# ---------- КЛАВИАТУРЫ ----------
+
+def main_menu():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("📐 Расчет по массе")
+    kb.add("⚙ Расчет по диаметру")
+    kb.add("❌ Отмена")
+    return kb
+
+def weave_menu():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("Бисмарк", "Якорное", "Панцирное")
+    kb.add("⬅ Назад")
+    return kb
+
+# ---------- СОСТОЯНИЯ ----------
+
+class CalcStates(StatesGroup):
+    choosing_mode = State()
+    choosing_weave = State()
+    waiting_for_mass = State()
+    waiting_for_length = State()
+    waiting_for_diameter = State()
+
+# ---------- СТАРТ ----------
+
+@dp.message_handler(commands=['start'])
+async def start_handler(message: types.Message):
+    await message.answer(
+        "💎 Ювелирный калькулятор\n\nВыберите режим:",
+        reply_markup=main_menu()
+    )
+    await CalcStates.choosing_mode.set()
+
+# ---------- ОТМЕНА ----------
+
+@dp.message_handler(lambda m: m.text == "❌ Отмена", state="*")
+async def cancel_handler(message: types.Message, state: FSMContext):
+    await state.finish()
+    await message.answer("Отменено.", reply_markup=main_menu())
+    await CalcStates.choosing_mode.set()
+
+# ---------- ВЫБОР РЕЖИМА ----------
+
+@dp.message_handler(lambda m: m.text in ["📐 Расчет по массе", "⚙ Расчет по диаметру"], state=CalcStates.choosing_mode)
+async def choose_mode(message: types.Message, state: FSMContext):
+    await state.update_data(mode=message.text)
+    await message.answer("Выберите тип плетения:", reply_markup=weave_menu())
+    await CalcStates.choosing_weave.set()
+
+# ---------- ВЫБОР ПЛЕТЕНИЯ ----------
+
+@dp.message_handler(lambda m: m.text in ["Бисмарк", "Якорное", "Панцирное"], state=CalcStates.choosing_weave)
+async def choose_weave(message: types.Message, state: FSMContext):
+    await state.update_data(weave=message.text)
+    data = await state.get_data()
+
+    if data["mode"] == "📐 Расчет по массе":
+        await message.answer("Введите массу цепи (г):")
+        await CalcStates.waiting_for_mass.set()
+    else:
+        await message.answer("Введите диаметр проволоки (мм):")
+        await CalcStates.waiting_for_diameter.set()
+
+# ---------- НАЗАД ----------
+
+@dp.message_handler(lambda m: m.text == "⬅ Назад", state="*")
+async def back_handler(message: types.Message, state: FSMContext):
+    await state.finish()
+    await message.answer("Выберите режим:", reply_markup=main_menu())
+    await CalcStates.choosing_mode.set()
+
+# ---------- МАССА ----------
+
+@dp.message_handler(state=CalcStates.waiting_for_mass)
+async def process_mass(message: types.Message, state: FSMContext):
+    try:
+        mass = float(message.text.replace(',', '.'))
+        if mass <= 0:
+            raise ValueError
+    except:
+        return await message.reply("Введите корректную массу.")
+
+    await state.update_data(mass=mass)
+    await message.answer("Введите длину цепи (см):")
+    await CalcStates.waiting_for_length.set()
+
+# ---------- ДЛИНА ----------
+
+@dp.message_handler(state=CalcStates.waiting_for_length)
+async def process_length(message: types.Message, state: FSMContext):
+    try:
+        length = float(message.text.replace(',', '.'))
+        if length <= 0:
+            raise ValueError
+    except:
+        return await message.reply("Введите корректную длину.")
+
+    data = await state.get_data()
+    M = data["mass"]
+    L = length
+    weave = data["weave"]
+
+    # коэффициенты для разных плетений
+    k_values = {
+        "Бисмарк": 2.5,
+        "Якорное": 2.3,
+        "Панцирное": 2.4
+    }
+
+    k = k_values.get(weave, 2.5)
+
+    d = math.sqrt((3 * M) / (k * L))
+    D_rigel = 2.7 * d
+
+    result = (
+        f"📊 Плетение: {weave}\n\n"
+        f"Диаметр проволоки: {d:.2f} мм\n"
+        f"Диаметр ригеля: {D_rigel:.2f} мм\n"
+    )
+
+    await state.finish()
+    await message.answer(result, reply_markup=main_menu())
+    await CalcStates.choosing_mode.set()
+
+# ---------- РАСЧЕТ ПО ДИАМЕТРУ ----------
+
+@dp.message_handler(state=CalcStates.waiting_for_diameter)
+async def process_diameter(message: types.Message, state: FSMContext):
+    try:
+        d = float(message.text.replace(',', '.'))
+        if d <= 0:
+            raise ValueError
+    except:
+        return await message.reply("Введите корректный диаметр.")
+
+    # примерная формула веса
+    weight_per_cm = 0.025 * d**2
+    weight_50cm = weight_per_cm * 50
+
+    result = (
+        f"📊 При диаметре {d:.2f} мм:\n\n"
+        f"Вес 1 см ≈ {weight_per_cm:.3f} г\n"
+        f"Вес цепи 50 см ≈ {weight_50cm:.2f} г"
+    )
+
+    await state.finish()
+    await message.answer(result, reply_markup=main_menu())
+    await CalcStates.choosing_mode.set()
+
+# ---------- ЗАПУСК ----------
+
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)

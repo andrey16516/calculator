@@ -1,0 +1,5 @@
+cd /d "C:\Users\Андрей\bismarck_bot"
+venv\Scripts\activate.bat
+
+python bot.py
+8749483224:AAEl94YvsgXxmAP7UDWcMYvZc01wZK0lj4w
