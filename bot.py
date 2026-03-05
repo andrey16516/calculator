@@ -772,6 +772,12 @@ async def ring_price(message: Message, state: FSMContext):
     await message.answer(text, reply_markup=kb_after_ring())
 
 
+@router.message(F.text == "💍 Еще одно кольцо")
+async def ring_again(message: Message, state: FSMContext):
+    # FIX: handle "Еще одно кольцо" button
+    await ring_entry(message, state)
+
+
 # -------------------- TUBE --------------------
 @router.message(F.text == "Расчет трубки")
 async def tube_entry(message: Message, state: FSMContext):
