@@ -2,12 +2,17 @@ import os
 import math
 from dataclasses import dataclass
 
-from aiogram import Dispatcher, Router, F
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.types import FSInputFile
+
+
+# ==================== CONFIG ====================
+# Your Telegram numeric ID (admin)
+ADMIN_ID = 290178850
 
 
 # -------------------- METALS / ASSAYS --------------------
@@ -202,6 +207,7 @@ def ring_weight_semiround_g(rho: float, L_mm: float, w_mm: float, t_mm: float) -
 
 # -------------------- KEYBOARDS --------------------
 def kb_main():
+    # "Обратная связь" строго ниже "Отмена", как вы просили
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🧮 Расчет цепи")],
@@ -209,6 +215,7 @@ def kb_main():
             [KeyboardButton(text="💍 Расчет обручальных колец")],
             [KeyboardButton(text="Расчет трубки")],
             [KeyboardButton(text="❌ Отмена")],
+            [KeyboardButton(text="📩 Обратная связь")],
         ],
         resize_keyboard=True
     )
@@ -380,6 +387,10 @@ class TubeStates(StatesGroup):
     thickness = State()
 
 
+class FeedbackStates(StatesGroup):
+    waiting_text = State()
+
+
 # -------------------- ROUTER --------------------
 router = Router()
 
@@ -401,6 +412,36 @@ async def cancel_any(message: Message, state: FSMContext):
 async def to_menu(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Меню:", reply_markup=kb_main())
+
+
+# -------------------- FEEDBACK --------------------
+@router.message(F.text == "📩 Обратная связь")
+async def feedback_start(message: Message, state: FSMContext):
+    await state.set_state(FeedbackStates.waiting_text)
+    await message.answer(
+        "Для добавления функций или внесения изменений вы можете написать текстовое сообщение прямо в это диалоговое окно.\n"
+        "Отправьте одним сообщением, что нужно изменить."
+    )
+
+
+@router.message(FeedbackStates.waiting_text)
+async def feedback_receive(message: Message, state: FSMContext, bot: Bot):
+    user = message.from_user
+    user_id = user.id if user else None
+    username = f"@{user.username}" if user and user.username else "(нет username)"
+    full_name = user.full_name if user else "(unknown)"
+
+    text_to_admin = (
+        "📩 Обратная связь\n"
+        f"От: {full_name} {username}\n"
+        f"User ID: {user_id}\n\n"
+        f"Сообщение:\n{message.text}"
+    )
+
+    await bot.send_message(ADMIN_ID, text_to_admin)
+
+    await state.clear()
+    await message.answer("Сообщение отправлено. Спасибо!", reply_markup=kb_main())
 
 
 # -------------------- CHAINS --------------------
@@ -774,7 +815,6 @@ async def ring_price(message: Message, state: FSMContext):
 
 @router.message(F.text == "💍 Еще одно кольцо")
 async def ring_again(message: Message, state: FSMContext):
-    # FIX: handle "Еще одно кольцо" button
     await ring_entry(message, state)
 
 
