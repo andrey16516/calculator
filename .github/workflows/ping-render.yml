@@ -1,0 +1,13 @@
+name: Ping Render health
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: curl -fsS https://calculator-2-y8ot.onrender.com/health > /dev/null
